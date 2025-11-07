@@ -40,6 +40,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     mask: np.array = None
+    depth: np.array = None
+    semantic: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -146,9 +148,22 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        
+        # Load depth map if exists (for depth supervision)
+        depth = None
+        depth_path = os.path.join(os.path.dirname(images_folder), "depths", f"{image_name}.npy")
+        if os.path.exists(depth_path):
+            depth = np.load(depth_path)
+        
+        # Load semantic map if exists (for semantic features)
+        semantic = None
+        semantic_path = os.path.join(os.path.dirname(images_folder), "semantics", f"{image_name}.png")
+        if os.path.exists(semantic_path):
+            semantic = np.array(Image.open(semantic_path))
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,  
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              depth=depth, semantic=semantic)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

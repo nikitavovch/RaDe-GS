@@ -59,6 +59,7 @@ class ModelParams(ParamGroup):
         self.use_coord_map = False
         self.disable_filter3D = False
         self.kernel_size = 0.0 # Size of 2D filter in mip-splatting
+        self.semantic_feature_dim = 0  # Feature-3DGS: Dimension of semantic features (0 = disabled)
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -86,6 +87,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.appearance_embeddings_lr = 0.001
         self.appearance_network_lr = 0.001
+        self.semantic_feature_lr = 0.0025  # Feature-3DGS: Learning rate for semantic features
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.lambda_depth_normal = 0.05

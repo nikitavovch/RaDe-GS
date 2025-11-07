@@ -61,7 +61,7 @@ def L1_loss_appearance(image, gt_image, gaussians, view_idx, return_transformed_
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, semantic_feature_dim=dataset.semantic_feature_dim)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -81,9 +81,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.compute_3D_filter(cameras=trainCameras)
 
     viewpoint_stack = None
-    ema_loss_for_log, ema_depth_loss_for_log, ema_mask_loss_for_log, ema_normal_loss_for_log = 0.0, 0.0, 0.0, 0.0
+    ema_loss_for_log, ema_depth_loss_for_log, ema_mask_loss_for_log, ema_normal_loss_for_log, ema_semantic_loss_for_log = 0.0, 0.0, 0.0, 0.0, 0.0
 
-    require_depth = not dataset.use_coord_map
+    # For SpatialGen: we need depth rendering for supervision even with coord_map
+    require_depth = True  # Always render depth for supervision loss
     require_coord = dataset.use_coord_map
     
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -140,26 +141,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         if reg_kick_on:
             lambda_depth_normal = opt.lambda_depth_normal
-            if require_depth:
-                rendered_expected_depth: torch.Tensor = render_pkg["expected_depth"]
-                rendered_median_depth: torch.Tensor = render_pkg["median_depth"]
-                rendered_normal: torch.Tensor = render_pkg["normal"]
-                depth_middepth_normal = depth_double_to_normal(viewpoint_cam, rendered_expected_depth, rendered_median_depth)
-            else:
+            
+            # Extract depth/coord based on mode
+            if require_coord:
+                # Coord mode: use coordinates for normal consistency
                 rendered_expected_coord: torch.Tensor = render_pkg["expected_coord"]
                 rendered_median_coord: torch.Tensor = render_pkg["median_coord"]
                 rendered_normal: torch.Tensor = render_pkg["normal"]
                 depth_middepth_normal = point_double_to_normal(viewpoint_cam, rendered_expected_coord, rendered_median_coord)
+            else:
+                # Depth mode: use depth for normal consistency
+                rendered_expected_depth: torch.Tensor = render_pkg["expected_depth"]
+                rendered_median_depth: torch.Tensor = render_pkg["median_depth"]
+                rendered_normal: torch.Tensor = render_pkg["normal"]
+                depth_middepth_normal = depth_double_to_normal(viewpoint_cam, rendered_expected_depth, rendered_median_depth)
+            
+            # Normal consistency loss
             depth_ratio = 0.6
             normal_error_map = (1 - (rendered_normal.unsqueeze(0) * depth_middepth_normal).sum(dim=1))
             depth_normal_loss = (1-depth_ratio) * normal_error_map[0].mean() + depth_ratio * normal_error_map[1].mean()
+            
+            # SpatialGen: Depth supervision (always try to use if depth is rendered)
+            depth_supervision_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+            if viewpoint_cam.gt_depth is not None and "expected_depth" in render_pkg and render_pkg["expected_depth"] is not None:
+                # Use rendered depth for supervision
+                rendered_expected_depth_for_supervision = render_pkg["expected_depth"]
+                depth_supervision_loss = l1_loss(rendered_expected_depth_for_supervision, viewpoint_cam.gt_depth.unsqueeze(0))
+                lambda_depth_supervision = 0.1  # Weight for depth supervision
+            else:
+                lambda_depth_supervision = 0
+            
+            # Feature-3DGS: Add semantic feature map loss if GT semantic is available
+            # This replaces the simple RGB-semantic loss with proper feature map distillation
+            semantic_feature_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+            if viewpoint_cam.gt_semantic is not None and gaussians.semantic_feature_dim > 0:
+                # Render semantic feature map (if available from render_pkg)
+                if 'feature_map' in render_pkg and render_pkg['feature_map'] is not None:
+                    rendered_feature_map = render_pkg['feature_map']
+                    # L1 loss between rendered features and GT semantic features
+                    semantic_feature_loss = l1_loss(rendered_feature_map, viewpoint_cam.gt_semantic)
+                    lambda_semantic_feature = 0.1  # Weight for feature distillation
+                else:
+                    # Fallback: use RGB-semantic supervision if feature_map rendering not available
+                    semantic_feature_loss = l1_loss(rendered_image, viewpoint_cam.gt_semantic)
+                    lambda_semantic_feature = 0.05
+            else:
+                lambda_semantic_feature = 0
         else:
             lambda_depth_normal = 0
+            lambda_depth_supervision = 0
+            lambda_semantic_feature = 0
             depth_normal_loss = torch.tensor([0],dtype=torch.float32,device="cuda")
+            depth_supervision_loss = torch.tensor([0],dtype=torch.float32,device="cuda")
+            semantic_feature_loss = torch.tensor([0],dtype=torch.float32,device="cuda")
             
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image, gt_image.unsqueeze(0)))
         
-        loss = rgb_loss + depth_normal_loss * lambda_depth_normal
+        loss = rgb_loss + depth_normal_loss * lambda_depth_normal + depth_supervision_loss * lambda_depth_supervision + semantic_feature_loss * lambda_semantic_feature
         loss.backward()
 
         iter_end.record()
@@ -168,9 +206,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_normal_loss_for_log = 0.4 * depth_normal_loss.item() + 0.6 * ema_normal_loss_for_log
+            ema_depth_loss_for_log = 0.4 * depth_supervision_loss.item() + 0.6 * ema_depth_loss_for_log
+            ema_semantic_loss_for_log = 0.4 * semantic_feature_loss.item() + 0.6 * ema_semantic_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}", "loss_normal": f"{ema_normal_loss_for_log:.{4}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{4}f}", 
+                    "normal": f"{ema_normal_loss_for_log:.{4}f}",
+                    "depth": f"{ema_depth_loss_for_log:.{4}f}",
+                    "feat": f"{ema_semantic_loss_for_log:.{4}f}"
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()

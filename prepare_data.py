@@ -7,8 +7,6 @@ import shutil
 from collections import OrderedDict
 import struct
 
-# --- Утилиты для записи в бинарном формате COLMAP ---
-
 def write_points3D_binary(points3D, path_to_file):
     with open(path_to_file, "wb") as fid:
         num_points = len(points3D)
@@ -98,24 +96,63 @@ def convert_spatialgen_to_rade(spatialgen_dir, rade_datadir):
     print(f"Начало конвертации данных из: {spatialgen_dir}")
     print(f"Целевая директория: {rade_datadir}")
 
-    input_dir = os.path.join(rade_datadir, "input")
+    images_dir = os.path.join(rade_datadir, "images")
     sparse_dir = os.path.join(rade_datadir, "sparse/0")
-    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(images_dir, exist_ok=True)
     os.makedirs(sparse_dir, exist_ok=True)
     print("Структура папок создана.")
 
     npz_path = os.path.join(spatialgen_dir, "inference_results.npz")
     ply_path = os.path.join(spatialgen_dir, "global_scene_ply.ply")
     
+    print("Загрузка данных из NPZ...")
     with np.load(npz_path, allow_pickle=True) as data:
         key = data.files[0]
         results = data[key].item()
+    
+    print(f"  Найдено: {len(results['input_rgbs'])} input views, {len(results['target_rgbs'])} target views")
 
     print("Копирование изображений...")
     all_rgbs = results['input_rgbs'] + results['target_rgbs']
     for i, rgb_data in enumerate(all_rgbs):
-        Image.fromarray(rgb_data.astype(np.uint8)).save(os.path.join(input_dir, f"{i}.png"))
-    print(f"Скопировано {len(all_rgbs)} изображений.")
+        # rgb_data уже в правильном формате (H, W, 3)
+        if rgb_data.max() <= 1.0:
+            rgb_data = (rgb_data * 255).astype(np.uint8)
+        else:
+            rgb_data = rgb_data.astype(np.uint8)
+        Image.fromarray(rgb_data).save(os.path.join(images_dir, f"{i}.png"))
+    print(f"  Сохранено {len(all_rgbs)} изображений.")
+    
+    # Сохранение depth maps (для depth supervision)
+    if 'input_depths' in results and 'target_depths' in results:
+        print("Сохранение depth maps...")
+        depth_dir = os.path.join(rade_datadir, "depths")
+        os.makedirs(depth_dir, exist_ok=True)
+        all_depths = results['input_depths'] + results['target_depths']
+        for i, depth_data in enumerate(all_depths):
+            np.save(os.path.join(depth_dir, f"{i}.npy"), depth_data)
+        print(f"  Сохранено {len(all_depths)} depth maps.")
+    
+    # Сохранение semantics (для semantic features)
+    if 'input_semantics' in results and 'target_semantics' in results:
+        print("Сохранение semantic maps...")
+        sem_dir = os.path.join(rade_datadir, "semantics")
+        os.makedirs(sem_dir, exist_ok=True)
+        all_semantics = results['input_semantics'] + results['target_semantics']
+        for i, sem_data in enumerate(all_semantics):
+            if sem_data.max() <= 1.0:
+                sem_data = (sem_data * 255).astype(np.uint8)
+            else:
+                sem_data = sem_data.astype(np.uint8)
+            Image.fromarray(sem_data).save(os.path.join(sem_dir, f"{i}.png"))
+        print(f"  Сохранено {len(all_semantics)} semantic maps.")
+    
+    # Сохранение scene scale (важно для метрической реконструкции)
+    if 'scene_scale' in results:
+        scale_file = os.path.join(rade_datadir, "scene_scale.txt")
+        with open(scale_file, 'w') as f:
+            f.write(str(results['scene_scale']))
+        print(f"  Сохранён scene_scale: {results['scene_scale']}")
 
     print("Конвертация облака точек в points3D.bin...")
     pcd = o3d.io.read_point_cloud(ply_path)

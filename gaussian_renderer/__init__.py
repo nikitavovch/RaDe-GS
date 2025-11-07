@@ -77,6 +77,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+    
+    # Feature-3DGS integration: Render semantic features separately
+    # We render semantic features as "colors" using the same rasterizer
+    feature_map = None
+    if hasattr(pc, 'get_semantic_feature') and pc.semantic_feature_dim > 0:
+        semantic_feature = pc.get_semantic_feature  # [N, 1, D] or [N, D]
+        # Reshape to [N, D] for rendering as "color"
+        if len(semantic_feature.shape) == 3:
+            semantic_feature_flat = semantic_feature.squeeze(1)  # [N, 1, D] -> [N, D]
+        else:
+            semantic_feature_flat = semantic_feature  # Already [N, D]
+        
+        # Ensure it's 2D
+        if len(semantic_feature_flat.shape) == 1:
+            semantic_feature_flat = semantic_feature_flat.unsqueeze(1)  # [N] -> [N, 1]
+        
+        # Pad to 3 channels if needed (rasterizer expects 3 channels)
+        if semantic_feature_flat.shape[1] < 3:
+            padding = torch.zeros(semantic_feature_flat.shape[0], 3 - semantic_feature_flat.shape[1], 
+                                 device=semantic_feature_flat.device, dtype=semantic_feature_flat.dtype)
+            semantic_feature_padded = torch.cat([semantic_feature_flat, padding], dim=1)
+        else:
+            semantic_feature_padded = semantic_feature_flat[:, :3]
+        
+        # Render semantic features as RGB (reuse rasterizer)
+        feature_map_render, _, _, _, _, _, _, _ = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = None,
+            colors_precomp = semantic_feature_padded,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
+        
+        # Extract only the semantic dimensions
+        feature_map = feature_map_render[:pc.semantic_feature_dim, :, :]
 
 
 
@@ -92,6 +129,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "normal":rendered_normal,
+            "feature_map": feature_map,  # Feature-3DGS integration
             }
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py

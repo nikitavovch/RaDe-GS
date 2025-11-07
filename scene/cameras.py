@@ -18,6 +18,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 depth=None, semantic=None,
                  ):
         super(Camera, self).__init__()
 
@@ -44,6 +45,21 @@ class Camera(nn.Module):
             self.gt_mask = gt_alpha_mask.to(self.data_device)
         else:
             self.gt_mask = None
+        
+        # Add depth supervision (from SpatialGen)
+        if depth is not None:
+            self.gt_depth = torch.from_numpy(depth).float().to(self.data_device)
+        else:
+            self.gt_depth = None
+        
+        # Add semantic map (for semantic features)
+        if semantic is not None:
+            # Convert semantic to tensor, normalize to [0, 1]
+            if semantic.max() > 1.0:
+                semantic = semantic.astype(np.float32) / 255.0
+            self.gt_semantic = torch.from_numpy(semantic).float().permute(2, 0, 1).to(self.data_device)
+        else:
+            self.gt_semantic = None
 
         self.zfar = 100.0
         self.znear = 0.01
