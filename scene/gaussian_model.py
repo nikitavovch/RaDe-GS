@@ -87,6 +87,7 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.appearance_network.state_dict(),
+            self._semantic_feature,
             self._appearance_embeddings
         )
     
@@ -103,6 +104,7 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale,
+        self._semantic_feature,
         app_dict,
         _appearance_embeddings) = model_args
         self.training_setup(training_args)
@@ -145,7 +147,6 @@ class GaussianModel:
     
     @property
     def get_semantic_feature(self):
-        # Feature-3DGS: Return semantic features
         return self._semantic_feature
     
     @property
@@ -180,6 +181,9 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
+    def rewrite_semantic_feature(self, x):
+        self._semantic_feature = x
+        
     @torch.no_grad()
     def reset_3D_filter(self):
         xyz = self.get_xyz
@@ -307,21 +311,20 @@ class GaussianModel:
             self.active_sh_degree += 1
 
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, semantic_feature_size : int, speedup: bool):
         self.spatial_lr_scale = spatial_lr_scale
-        if type(pcd) is BasicPointCloud:
-            fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        else:
-            fused_point_cloud = torch.tensor(np.asarray(pcd._xyz)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd._rgb)).float().cuda())
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
-
+        
+        if speedup: # speed up for Segmentation
+            semantic_feature_size = int(semantic_feature_size/4)
+        self._semantic_feature = torch.zeros(fused_point_cloud.shape[0], semantic_feature_size, 1).float().cuda() 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud.detach().clone().float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -335,14 +338,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
-        # Feature-3DGS: Initialize semantic features (zero-initialized, will be trained)
-        if self.semantic_feature_dim > 0:
-            self._semantic_feature = torch.zeros(fused_point_cloud.shape[0], self.semantic_feature_dim, 1).float().cuda()
-            self._semantic_feature = nn.Parameter(self._semantic_feature.transpose(1, 2).contiguous().requires_grad_(True))
-            print(f"Initialized semantic features: {self._semantic_feature.shape} (dim={self.semantic_feature_dim})")
-        else:
-            self._semantic_feature = torch.empty(0)
+        self._semantic_feature = nn.Parameter(self._semantic_feature.transpose(1, 2).contiguous().requires_grad_(True))
 
 
     def training_setup(self, training_args):
@@ -360,12 +356,9 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._appearance_embeddings], 'lr': training_args.appearance_embeddings_lr, "name": "appearance_embeddings"},
-            {'params': self.appearance_network.parameters(), 'lr': training_args.appearance_network_lr, "name": "appearance_network"}
+            {'params': self.appearance_network.parameters(), 'lr': training_args.appearance_network_lr, "name": "appearance_network"},
+            {'params': [self._semantic_feature], 'lr':training_args.semantic_feature_lr, "name": "semantic_feature"},
         ]
-        
-        # Feature-3DGS: Add semantic feature optimization
-        if self.semantic_feature_dim > 0 and self._semantic_feature.numel() > 0:
-            l.append({'params': [self._semantic_feature], 'lr': training_args.semantic_feature_lr, "name": "semantic_feature"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -393,12 +386,10 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(self._semantic_feature.shape[1]*self._semantic_feature.shape[2]):  
+            l.append('semantic_{}'.format(i))
         if not exclude_filter:
             l.append('filter_3D')
-        # Feature-3DGS: Add semantic features to PLY
-        if hasattr(self, 'semantic_feature_dim') and self.semantic_feature_dim > 0:
-            for i in range(self.semantic_feature_dim):
-                l.append('semantic_feature_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -413,18 +404,12 @@ class GaussianModel:
         rotation = self._rotation.detach().cpu().numpy()
 
         filter_3D = self.filter_3D.detach().cpu().numpy()
-        
-        # Feature-3DGS: Save semantic features if they exist
-        if hasattr(self, '_semantic_feature') and self.semantic_feature_dim > 0:
-            # Shape: [N, 1, D] -> [N, D]
-            semantic_features = self._semantic_feature.detach().squeeze(1).cpu().numpy()
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, filter_3D, semantic_features), axis=1)
-        else:
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, filter_3D), axis=1)
+        semantic_feature = self._semantic_feature.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() 
         
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
-
+        
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, filter_3D, semantic_feature), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -560,6 +545,10 @@ class GaussianModel:
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
 
+        count = sum(1 for name in plydata.elements[0].data.dtype.names if name.startswith("semantic_"))
+        semantic_feature = np.stack([np.asarray(plydata.elements[0][f"semantic_{i}"]) for i in range(count)], axis=1) 
+        semantic_feature = np.expand_dims(semantic_feature, axis=-1) 
+        
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
         assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
@@ -588,27 +577,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device="cuda")
-        
-        # Feature-3DGS: Load semantic features if they exist in the PLY file
-        if self.semantic_feature_dim > 0:
-            semantic_feature_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("semantic_feature_")]
-            if len(semantic_feature_names) > 0:
-                semantic_features = np.zeros((xyz.shape[0], len(semantic_feature_names)))
-                for idx, attr_name in enumerate(sorted(semantic_feature_names, key=lambda x: int(x.split('_')[-1]))):
-                    semantic_features[:, idx] = np.asarray(plydata.elements[0][attr_name])
-                # Shape: [N, D] -> [N, 1, D]
-                self._semantic_feature = nn.Parameter(
-                    torch.tensor(semantic_features, dtype=torch.float, device="cuda").unsqueeze(1).requires_grad_(True)
-                )
-                print(f"Loaded semantic features: {self._semantic_feature.shape}")
-            else:
-                print(f"⚠️ No semantic features found in PLY, initializing to zeros")
-                self._semantic_feature = nn.Parameter(
-                    torch.zeros((xyz.shape[0], 1, self.semantic_feature_dim), dtype=torch.float, device="cuda").requires_grad_(True)
-                )
-        else:
-            self._semantic_feature = nn.Parameter(torch.zeros((0,), device="cuda").requires_grad_(True))
-
+        self._semantic_feature = nn.Parameter(torch.tensor(semantic_feature, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -658,14 +627,12 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._semantic_feature = optimizable_tensors["semantic_feature"]
         
-        # Feature-3DGS: Update semantic features if available
-        if "semantic_feature" in optimizable_tensors:
-            self._semantic_feature = optimizable_tensors["semantic_feature"]
-
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
         self.xyz_gradient_accum_abs_max = self.xyz_gradient_accum_abs_max[valid_points_mask]
+
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
@@ -699,13 +666,9 @@ class GaussianModel:
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
-        
-        # Feature-3DGS: Add semantic features if available
-        if new_semantic_feature is not None and self.semantic_feature_dim > 0:
-            d["semantic_feature"] = new_semantic_feature
-        
-        extension_num = new_xyz.shape[0]
+        "rotation" : new_rotation,
+        "semantic_feature": new_semantic_feature}
+
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -713,17 +676,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        
-        # Feature-3DGS: Update semantic features
-        if "semantic_feature" in optimizable_tensors:
-            self._semantic_feature = optimizable_tensors["semantic_feature"]
+        self._semantic_feature = optimizable_tensors["semantic_feature"] 
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # self.max_radii2D = torch.cat([self.max_radii2D,torch.zeros(extension_num, device="cuda")])
 
     def densify_and_split(self, grads, grad_threshold,  grads_abs, grad_abs_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -748,7 +707,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_semantic_feature = self._semantic_feature[selected_pts_mask].repeat(N,1,1) if self._semantic_feature is not None else None
+        new_semantic_feature = self._semantic_feature[selected_pts_mask].repeat(N,1,1)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic_feature)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -787,7 +746,7 @@ class GaussianModel:
         # new_opacities = 1-torch.sqrt(1-self.get_opacity[selected_pts_mask]*0.5)
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_semantic_feature = self._semantic_feature[selected_pts_mask] if self._semantic_feature is not None else None
+        new_semantic_feature = self._semantic_feature[selected_pts_mask]
         
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic_feature)
 

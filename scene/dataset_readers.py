@@ -27,6 +27,7 @@ import cv2
 import trimesh
 import open3d as o3d
 import re
+import torch
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -41,7 +42,9 @@ class CameraInfo(NamedTuple):
     height: int
     mask: np.array = None
     depth: np.array = None
-    semantic: np.array = None
+    semantic_feature: torch.tensor 
+    semantic_feature_path: str 
+    semantic_feature_name: str 
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -49,6 +52,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    semantic_feature_dim: int
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -115,7 +119,7 @@ def read_pfm(filename: str):
     return data, scale
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, semantic_feature_folder):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -155,15 +159,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         if os.path.exists(depth_path):
             depth = np.load(depth_path)
         
-        # Load semantic map if exists (for semantic features)
-        semantic = None
-        semantic_path = os.path.join(os.path.dirname(images_folder), "semantics", f"{image_name}.png")
-        if os.path.exists(semantic_path):
-            semantic = np.array(Image.open(semantic_path))
+        semantic_feature_path = os.path.join(semantic_feature_folder, image_name) + '_fmap_CxHxW.pt' 
+        semantic_feature_name = os.path.basename(semantic_feature_path).split(".")[0]
+        semantic_feature = torch.load(semantic_feature_path) 
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,  
                               image_path=image_path, image_name=image_name, width=width, height=height,
-                              depth=depth, semantic=semantic)
+                              depth=depth, semantic_feature=semantic_feature,
+                              semantic_feature_path=semantic_feature_path,
+                              semantic_feature_name=semantic_feature_name)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -216,8 +220,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    semantic_feature_dir = "semantic_features"
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), semantic_feature_folder=os.path.join(path, semantic_feature_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    semantic_feature_dim = cam_infos[0].semantic_feature.shape[0]
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
@@ -254,10 +260,11 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           semantic_feature_dim=semantic_feature_dim)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, semantic_feature_folder, extension=".png"):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -294,16 +301,28 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
+            semantic_feature_path = os.path.join(semantic_feature_folder, image_name) + '_fmap_CxHxW.pt' 
+            semantic_feature_name = os.path.basename(semantic_feature_path).split(".")[0]
+            semantic_feature = torch.load(semantic_feature_path)
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], mask=None))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], mask=None,
+                              semantic_feature=semantic_feature,
+                              semantic_feature_path=semantic_feature_path,
+                              semantic_feature_name=semantic_feature_name))
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extension=".png"):
+    if foundation_model =='sam':
+        semantic_feature_dir = "sam_embeddings" 
+    elif foundation_model =='lseg':
+        semantic_feature_dir = "rgb_feature_langseg" 
+    
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir))
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, white_background, semantic_feature_folder=os.path.join(path, semantic_feature_dir))
     train_cam_infos = train_cam_infos
     print("train num:", len(train_cam_infos))
     # if not eval:
@@ -333,7 +352,8 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path,
-                           point_cloud=pcd)
+                           point_cloud=pcd,
+                           semantic_feature_dim=semantic_feature_dim)
     return scene_info
 
 
